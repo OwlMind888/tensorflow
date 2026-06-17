@@ -53,9 +53,10 @@ void GatherFusionInstructions(
 }  // namespace
 
 /* static */ absl::StatusOr<std::unique_ptr<LogicalBufferAnalysis>>
-LogicalBufferAnalysis::Run(const HloModule* module) {
+LogicalBufferAnalysis::Run(const HloModule* module,
+                           bool alias_buffer_across_dataflow) {
   std::unique_ptr<LogicalBufferAnalysis> analysis(
-      new LogicalBufferAnalysis(module));
+      new LogicalBufferAnalysis(module, alias_buffer_across_dataflow));
   RETURN_IF_ERROR(analysis->Analyze());
   return analysis;
 }
@@ -244,6 +245,19 @@ absl::Status LogicalBufferAnalysis::HandleAsyncStart(
           NewLogicalBuffer(async_start, index);
         }
       });
+  return absl::OkStatus();
+}
+
+absl::Status LogicalBufferAnalysis::HandleAsyncUpdate(
+    HloInstruction* async_update) {
+  // AsyncUpdate only creates the top-level tuple buffer.
+  NewLogicalBuffer(async_update, /*index=*/{});
+  return absl::OkStatus();
+}
+
+absl::Status LogicalBufferAnalysis::HandleAsyncDone(
+    HloInstruction* async_done) {
+  // AsyncDone doesn't create any buffers.
   return absl::OkStatus();
 }
 
