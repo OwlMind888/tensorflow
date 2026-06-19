@@ -344,5 +344,11 @@ bool IsAllReplicasLocal(int64_t gpus_per_host,
   });
 }
 
+bool IsTritonCollectiveKernel(
+    CollectiveBackendConfig::CollectiveKernelStrategy ks) {
+  return ks == CollectiveBackendConfig::KERNEL_STRATEGY_TRITON_ONE_SHOT ||
+         ks == CollectiveBackendConfig::KERNEL_STRATEGY_TRITON_TWO_SHOT;
+}
+
 }  // namespace gpu
 }  // namespace xla
