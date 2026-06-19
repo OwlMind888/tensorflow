@@ -23,11 +23,13 @@ limitations under the License.
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/functional/overload.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -74,6 +76,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_broadcast_thunk.h"
 #include "xla/backends/gpu/runtime/collective_group_thunk.h"
 #include "xla/backends/gpu/runtime/collective_kernel_thunk.h"
+#include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/collective_permute_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
@@ -135,6 +138,7 @@ limitations under the License.
 #include "xla/service/call_graph.h"
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/collective_opt_utils.h"
+#include "xla/service/computation_placer.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/custom_kernel_emitter.h"
@@ -154,6 +158,7 @@ limitations under the License.
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/service/gpu/triton_call.h"
+#include "xla/service/gpu_topology.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_creation_utils.h"
 #include "xla/service/llvm_ir/buffer_assignment_util.h"
@@ -212,90 +217,84 @@ bool IsHostExecuteCustomCall(const HloInstruction& hlo) {
                              // the TPU one
 }
 
-template <typename ThunkType>
-static constexpr bool kRequiresCollectiveKernelThunk =
-    std::is_constructible_v<ThunkType, Thunk::ThunkInfo,
-                            const HloAllReduceInstruction*,
-                            std::vector<CollectiveThunk::Buffer>,
-                            std::unique_ptr<CollectiveKernelThunk>,
-                            /*p2p_memcpy_enabled=*/bool>;
+}  // namespace
 
-// The signature of this function would change to absl::Status once we lift the
-// CollectiveKernelThunk out as a top level thunk. It would then become a member
-// function of ThunkEmitter.
-// As it stands now the collective kernel thunk is wrapped inside other
-// collective thunks such as AllReduceStart. So this function is only
-// responsible for emitting the collective kernel thunk and its dependencies.
-xla::Future<std::unique_ptr<CollectiveKernelThunk>> EmitCollectiveKernelThunk(
-    IrEmitterContext* ir_emitter_context, const CallGraph& call_graph,
+AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
     Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
-    const HloAllReduceInstruction* instr, const AllReduceConfig& config,
-    ThunkEmitter* compiler,
-    std::vector<std::unique_ptr<HloFusionAnalysis>>&
-        analysis_garbage_collector) {
+    const HloInstruction* instr, const CollectiveConfig& config,
+    CollectiveOpSpec op_spec) {
   std::unique_ptr<HloModule> fused_module =
       NewModuleWithFusion(instr, HloInstruction::FusionKind::kLoop);
   HloFusionInstruction* fusion_instr = Cast<HloFusionInstruction>(
       fused_module->entry_computation()->root_instruction());
+  static constexpr bool kMultimemDisabled = false;
+  const bool should_flatten = std::visit(
+      absl::Overload(
+          [&](const AllReduceOpSpec& spec) {
+            const int64_t size_bytes =
+                ShapeUtil::ElementsIn(instr->shape()) *
+                primitive_util::ByteWidth(instr->shape().element_type());
+            return GetAllReduceStrategy(size_bytes, kMultimemDisabled) ==
+                   se::gpu::AllReduceStrategy::kTwoShot;
+          },
+          [&](const auto& spec) { return false; }),
+      op_spec);
   const bool has_rank_higher_than_1 =
       instr->shape().IsArray() && instr->shape().dimensions().size() > 1;
-  const se::DeviceDescription& device_info =
-      ir_emitter_context->gpu_device_info();
   bool is_collective_kernel_enabled =
       instr->GetModule()
           ->config()
           .debug_options()
           .xla_gpu_unsupported_use_all_reduce_one_shot_kernel();
-  static constexpr bool kMultimemDisabled = false;
-  if (is_collective_kernel_enabled && has_rank_higher_than_1) {
-    const int64_t size_bytes =
-        ShapeUtil::ElementsIn(instr->shape()) *
-        primitive_util::ByteWidth(instr->shape().element_type());
-    const bool is_two_shot =
-        GetAllReduceStrategy(size_bytes, kMultimemDisabled) ==
-        se::gpu::AllReduceStrategy::kTwoShot;
-    if (is_two_shot) {
-      RETURN_IF_ERROR(FlattenCollectiveFusion(fusion_instr));
-    }
+  if (is_collective_kernel_enabled && has_rank_higher_than_1 &&
+      should_flatten) {
+    RETURN_IF_ERROR(FlattenCollectiveFusion(fusion_instr));
   }
   const auto make_thunk =
       [thunk_info = std::move(thunk_info), buffers = std::move(buffers), config,
-       is_async = !IsGPUSyncCollective(*instr), is_collective_kernel_enabled](
+       op_spec, is_async = !IsGPUSyncCollective(*instr),
+       is_collective_kernel_enabled](
           absl::string_view kernel_name, int32_t shmem_bytes,
           LaunchDimensions launch_dimensions, const std::vector<uint8_t>& cubin,
           bool use_pdl) {
         return std::make_unique<CollectiveKernelThunk>(
-            thunk_info, config.config, config.reduction_kind, is_async,
-            std::move(buffers), is_collective_kernel_enabled, kernel_name,
-            launch_dimensions, shmem_bytes, kMultimemDisabled,
+            thunk_info, config, op_spec, is_async, std::move(buffers),
+            is_collective_kernel_enabled, kernel_name, launch_dimensions,
+            shmem_bytes, kMultimemDisabled,
             !cubin.empty() ? std::make_optional(cubin) : std::nullopt, use_pdl);
       };
-  ASSIGN_OR_RETURN(bool did_set_config, TrySetGpuBackendConfigForCollective(
-                                            device_info, fusion_instr));
-  if (!did_set_config) {
-    // TODO(b/522693539):
-    // Because of lack of topology information in the CollectiveKernelThunk,
-    // we cannot know during emission if we can use the collective kernel
-    // thunk or not.
-    return nullptr;
+  const GpuTopology& gpu_topology = ir_emitter_context_->gpu_topology();
+  const DeviceAssignment* device_assignment = nullptr;
+  if (ir_emitter_context_->hlo_module()
+          .config()
+          .has_static_device_assignment()) {
+    device_assignment =
+        &ir_emitter_context_->hlo_module().config().static_device_assignment();
   }
-  analysis_garbage_collector.push_back(
+  ASSIGN_OR_RETURN(bool did_set_config,
+                   TrySetGpuBackendConfigForCollective(
+                       gpu_topology, fusion_instr, device_assignment));
+  if (!did_set_config) {
+    return Internal("Failed to set GPU backend config for collective kernel.");
+  }
+  analysis_garbage_collector_.push_back(
       std::make_unique<HloFusionAnalysis>(HloFusionAnalysis::Create(
-          *fusion_instr, ir_emitter_context->gpu_device_info())));
+          *fusion_instr, ir_emitter_context_->gpu_device_info())));
   auto emitter =
-      std::make_unique<TritonFusion>(*analysis_garbage_collector.back());
+      std::make_unique<TritonFusion>(*analysis_garbage_collector_.back());
 
   ASSIGN_OR_RETURN(std::vector<Shape> unmanaged_arguments,
                    GetCollectiveUnmanagedKernelArguments(fusion_instr));
   return emitter
-      ->Emit(*ir_emitter_context, *fusion_instr,
+      ->Emit(*ir_emitter_context_, *fusion_instr,
              /*instr_override=*/instr, unmanaged_arguments)
       .Map([make_thunk = std::move(make_thunk),
             fused_module =
                 std::move(fused_module)](TritonFusion::EmitResult result) {
-        return make_thunk(result.entry.kernel_name, result.entry.shmem_bytes,
-                          result.entry.launch_dimensions,
-                          std::move(result.entry.binary), result.entry.use_pdl);
+        return ThunkSequence::Of(
+            make_thunk(result.entry.kernel_name, result.entry.shmem_bytes,
+                       result.entry.launch_dimensions,
+                       std::move(result.entry.binary), result.entry.use_pdl));
       });
 }
 
@@ -336,8 +335,6 @@ absl::StatusOr<std::string> CanonicalGemmHlo(
   return instr->ToString(HloPrintOptions::Fingerprint()) +
          BackendConfigWrapper(gpu_config).GetRawString();
 }
-
-}  // namespace
 
 ThunkEmitter::ThunkEmitter(
     IrEmitterContext* absl_nonnull ir_emitter_context,
@@ -2016,35 +2013,33 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveThunk(
   if (ir_emitter_context_->debug_options().xla_syntax_sugar_async_ops()) {
     thunk_info.profile_annotation = async_start->name();
   }
+
   AsyncThunkSequence thunks;
-  // TODO(b/828435206) Remove this constexpr once collective kernel thunk is
-  // lifted out of the all reduce thunk.
-  if constexpr (kRequiresCollectiveKernelThunk<CollectiveThunkType>) {
-    thunks =
-        EmitCollectiveKernelThunk(ir_emitter_context_, *call_graph_, thunk_info,
-                                  buffers, Cast<HloAllReduceInstruction>(inst),
-                                  GetAllReduceConfigInst(inst), this,
-                                  analysis_garbage_collector_)
-            .Map([thunk_info = std::move(thunk_info),
-                  use_memcpy_local_p2p = ir_emitter_context_->debug_options()
-                                             .xla_gpu_use_memcpy_local_p2p(),
-                  buffers = std::move(buffers),
-                  inst](std::unique_ptr<CollectiveKernelThunk>
-                            collective_kernel_thunk) {
-              return ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
-                  thunk_info, inst, /*buffers=*/std::move(buffers),
-                  std::move(collective_kernel_thunk), use_memcpy_local_p2p));
-            });
-  } else if constexpr (std::is_constructible_v<
-                           CollectiveThunkType, Thunk::ThunkInfo,
-                           decltype(inst),
-                           std::vector<CollectiveThunk::Buffer>>) {
-    thunks = ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
-        thunk_info, inst, /*buffers=*/std::move(buffers)));
+
+  bool use_triton = false;
+  auto gpu_config_status = inst->template backend_config<GpuBackendConfig>();
+  if (gpu_config_status.ok()) {
+    use_triton = IsTritonCollectiveKernel(
+        gpu_config_status->collective_backend_config().kernel_strategy());
+  }
+  if (use_triton) {
+    ASSIGN_OR_RETURN(CollectiveOpSpec op_spec, ExtractCollectiveOpSpec(inst));
+    CollectiveConfig collective_config =
+        GetCollectiveConfig(inst, use_global_device_ids);
+
+    thunks = EmitCollectiveKernelThunk(thunk_info, buffers, inst,
+                                       collective_config, op_spec);
   } else {
-    thunks = ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
-        thunk_info, inst, /*buffers=*/std::move(buffers),
-        ir_emitter_context_->debug_options().xla_gpu_use_memcpy_local_p2p()));
+    if constexpr (std::is_constructible_v<
+                      CollectiveThunkType, Thunk::ThunkInfo, decltype(inst),
+                      std::vector<CollectiveThunk::Buffer>>) {
+      thunks = ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
+          thunk_info, inst, /*buffers=*/std::move(buffers)));
+    } else {
+      thunks = ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
+          thunk_info, inst, /*buffers=*/std::move(buffers),
+          ir_emitter_context_->debug_options().xla_gpu_use_memcpy_local_p2p()));
+    }
   }
 
   // For synchronous collectives, emit thunk directly without async wrapping.
